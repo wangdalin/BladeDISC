@@ -27,7 +27,7 @@
 
 #define DEBUG_TYPE "disc-dot-merge"
 
-// NOTE: this pass shares some common functions with lhlo-fusion-pass. The dot
+// TODO: this pass shares some common functions with lhlo-fusion-pass. The dot
 // merge can actually be regarded as a kind of horizontal fusion. We will
 // reassess the necessity of merging this pass into the fusion-pass after fixing
 // the bugs in horizontal fusion functions in lhlo-fusion-pass.
@@ -86,12 +86,12 @@ void arrangeOperandsInsertPointInBlock(Operation* op) {
 }
 
 void buildBlockGraphCycles(Block* block,
-                           std::unique_ptr<GraphCycles> cycle_detector,
-                           DenseMap<Operation*, int64_t>& op_to_id) {
+                           std::unique_ptr<GraphCycles>& cycle_detector,
+                           DenseMap<Operation*, int64_t>& op_to_node_id) {
   std::vector<Operation*> op_list;
-  op_to_id.clear();
+  op_to_node_id.clear();
   for (Operation& op : *block) {
-    op_to_id.try_emplace(&op, op_list.size());
+    op_to_node_id.try_emplace(&op, op_list.size());
     op_list.push_back(&op);
   }
   cycle_detector.reset(new GraphCycles(op_list.size()));
@@ -100,8 +100,8 @@ void buildBlockGraphCycles(Block* block,
     for (Value operand : GetAllPossibleUsedValues(op)) {
       Operation* operand_op = operand.getDefiningOp();
       // Only consider the operand_op inside the target block.
-      auto iter = op_to_id.find(operand_op);
-      if (iter == op_to_id.end()) {
+      auto iter = op_to_node_id.find(operand_op);
+      if (iter == op_to_node_id.end()) {
         continue;
       }
       cycle_detector->InsertEdge(iter->second, node_id);
@@ -512,8 +512,8 @@ bool DotBatchingConverter::batchingDots(
 
   // Form cycle detector.
   std::unique_ptr<GraphCycles> cycle_detector(new GraphCycles(0));
-  DenseMap<Operation*, int64_t> op_to_id;
-  buildBlockGraphCycles(block, std::move(cycle_detector), op_to_id);
+  DenseMap<Operation*, int64_t> op_to_node_id;
+  buildBlockGraphCycles(block, cycle_detector, op_to_node_id);
 
   // Find batch clusters.
   SmallVector<DotCluster> batch_clusters;
@@ -524,7 +524,8 @@ bool DotBatchingConverter::batchingDots(
     }
     SmallVector<DotCluster> clusters;
     for (auto op : ops) {
-      clusters.emplace_back(op.getOperation(), op_to_id[op.getOperation()]);
+      clusters.emplace_back(op.getOperation(),
+                            op_to_node_id[op.getOperation()]);
     }
     for (int64_t i = 0; i < clusters.size(); i++) {
       auto& batched = clusters[i];
