@@ -242,6 +242,8 @@ LogicalResult LowerHLOToLLVM(ModuleOp m, const DISCLoweringOptions& options) {
     pm.addNestedPass<FuncOp>(disc_ral::createDiscGpuConvPaddingLegalization());
   }
 
+  pm.addNestedPass<FuncOp>(disc_ral::createDiscDotMergePass());
+
   // We currently do not support AMP in AICompiler side. If
   // `TAO_MLIR_ENABLE_AMP` is set, we simply convert all gemm ops to fp16.
   //
