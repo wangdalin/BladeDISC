@@ -515,6 +515,38 @@ bool DotBatchingConverter::batchingDots(
   DenseMap<Operation*, int64_t> op_to_node_id;
   buildBlockGraphCycles(block, cycle_detector, op_to_node_id);
 
+  auto tryMergeDotClusters = [&](DotCluster& dst, DotCluster& src) {
+    // Make sure there is no shared operand. We want to deal with shared operand
+    // in same-operand dot merging phase.
+    // TODO: remove this checking when the same-operand dot merging phase is
+    // done and is placed ahead.
+    DenseSet<Value> lhs_operands;
+    DenseSet<Value> rhs_operands;
+    for (auto op : dst.ops) {
+      lhs_operands.insert(op->getOperand(0));
+      rhs_operands.insert(op->getOperand(1));
+    }
+    for (auto op : src.ops) {
+      if (!lhs_operands.insert(op->getOperand(0)).second ||
+          !rhs_operands.insert(op->getOperand(1)).second) {
+        return false;
+      }
+    }
+
+    // Check cycle.
+    int64_t dst_id = dst.leader_op_id;
+    int64_t src_id = src.leader_op_id;
+    auto optional_merged_id =
+        TryMergeNode(cycle_detector.get(), dst_id, src_id);
+    if (!optional_merged_id.hasValue()) {
+      // It forms a cycle.
+      return false;
+    }
+    dst.merge(src);
+    dst.leader_op_id = *optional_merged_id;
+    return true;
+  };
+
   // Find batch clusters.
   SmallVector<DotCluster> batch_clusters;
   for (auto& equal_dots : equal_shape_map) {
@@ -532,22 +564,13 @@ bool DotBatchingConverter::batchingDots(
       if (batched.ops.empty()) {
         continue;
       }
-      for (int64_t j = 0; j < clusters.size(); j++) {
+      for (int64_t j = i + 1; j < clusters.size(); j++) {
         auto& to_batch = clusters[j];
         if (to_batch.ops.empty()) {
           continue;
         }
         // Try merge.
-        int64_t batched_id = batched.leader_op_id;
-        int64_t to_batch_id = to_batch.leader_op_id;
-        auto optional_merged_id =
-            TryMergeNode(cycle_detector.get(), batched_id, to_batch_id);
-        if (!optional_merged_id.hasValue()) {
-          // It forms a cycle.
-          continue;
-        }
-        batched.merge(to_batch);
-        batched.leader_op_id = *optional_merged_id;
+        tryMergeDotClusters(batched, to_batch);
       }
     }
     for (auto& cluster : clusters) {
