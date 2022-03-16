@@ -19,16 +19,43 @@ func @dot_batching(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>, %m: tensor<in
   %4 = "mhlo.abs"(%1) : (tensor<?x?xf32>) -> tensor<?x?xf32>
   %5 = "mhlo.dot_general"(%3, %4) {dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>} : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   %6 = "mhlo.add"(%2, %5) : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
-  // CHECK: mhlo.concatenate
-  // CHECK: mhlo.concatenate
-  // CHECK: mhlo.dot_general
+  // CHECK-NOT: mhlo.dynamic_reshape
+  // CHECK:     mhlo.concatenate
+  // CHECK:     mhlo.concatenate
+  // CHECK:     mhlo.dot_general
   // CHECK-DAG: lhs_batching_dimensions = [0]
   // CHECK-DAG: rhs_batching_dimensions = [0]
   // CHECK-DAG: lhs_contracting_dimensions = [2]
   // CHECK-DAG: rhs_contracting_dimensions = [1]
-  // CHECK: -> tensor<2x?x?xf32>
+  // CHECK:     -> tensor<2x?x?xf32>
   // CHECK-NOT: mhlo.dot_general
+  // CHECK:     mhlo.real_dynamic_slice
   return %5: tensor<?x?xf32>
+}
+
+// CHECK-LABEL: func @dot_batching_static
+func @dot_batching_static(%arg0: tensor<128x256xf32>, %arg1: tensor<256x512xf32>) -> tensor<128x512xf32> {
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %0 = "mhlo.dot_general"(%arg0, %arg1) {dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>} : (tensor<128x256xf32>, tensor<256x512xf32>) -> tensor<128x512xf32>
+  %1 = "mhlo.abs"(%arg0) : (tensor<128x256xf32>) -> tensor<128x256xf32>
+  %2 = "mhlo.abs"(%arg1) : (tensor<256x512xf32>) -> tensor<256x512xf32>
+  %3 = "mhlo.dot_general"(%1, %2) {dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>} : (tensor<128x256xf32>, tensor<256x512xf32>) -> tensor<128x512xf32>
+  %4 = "mhlo.add"(%0, %3) : (tensor<128x512xf32>, tensor<128x512xf32>) -> tensor<128x512xf32>
+  // CHECK-NOT: mhlo.dynamic_reshape
+  // CHECK:     mhlo.reshape
+  // CHECK:     mhlo.concatenate
+  // CHECK:     mhlo.concatenate
+  // CHECK:     mhlo.dot_general
+  // CHECK-DAG: lhs_batching_dimensions = [0]
+  // CHECK-DAG: rhs_batching_dimensions = [0]
+  // CHECK-DAG: lhs_contracting_dimensions = [2]
+  // CHECK-DAG: rhs_contracting_dimensions = [1]
+  // CHECK:     -> tensor<2x128x512xf32>
+  // CHECK-NOT: mhlo.dot_general
+  // CHECK:     mhlo.slice
+  // CHECK-NOT: mhlo.real_dynamic_slice
+  return %4: tensor<128x512xf32>
 }
 
 // CHECK-LABEL: func @dot_not_batching_diff_dtype

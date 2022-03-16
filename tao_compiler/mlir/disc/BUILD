@@ -1286,8 +1286,10 @@ cc_library(
     name = "disc_dot_merge",
     srcs = ["transforms/disc_dot_merge.cc"],
     hdrs = [
+        "transforms/passes.h",
     ],
     deps = [
+        ":disc_util",
         ":mhlo_disc",
         ":pass_details",
         ":shape_utils",

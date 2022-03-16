@@ -21,8 +21,11 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "tensorflow/compiler/mlir/disc/disc_util.h"
 #include "tensorflow/compiler/mlir/disc/transforms/PassDetail.h"
 #include "tensorflow/compiler/mlir/disc/transforms/shape_utils.h"
+
+#define DEBUG_TYPE "disc-dot-merge"
 
 namespace mlir {
 namespace disc_ral {
@@ -157,23 +160,10 @@ void DotBatchingConverter::run() {
 bool DotBatchingConverter::buildShapedDotMap() {
   ShapeAnalysis analysis(func_);
   if (failed(analysis.run())) {
-    // error message should be generated inside the above function call.
+    LLVM_DEBUG(llvm::dbgs() << "ShapeAnalysis failes for dot merge.\n");
     return false;
   }
   func_.walk([&](mhlo::DotGeneralOp op) {
-#if 0
-    llvm::errs() << "[ZZ] dot: " << op << "\n";
-    int64_t l_rank = op.lhs().getType().cast<RankedTensorType>().getRank();
-    for (int64_t i = 0; i < l_rank; i++) {
-      llvm::errs() << "\t[ZZ] lhs-dim " << i << "\n";
-      analysis.getDimValue(op.lhs(), i).dump();
-    }
-    int64_t r_rank = op.rhs().getType().cast<RankedTensorType>().getRank();
-    for (int64_t i = 0; i < r_rank; i++) {
-      llvm::errs() << "\t[ZZ] rhs-dim " << i << "\n";
-      analysis.getDimValue(op.rhs(), i).dump();
-    }
-#endif
     DotShape dot_shape;
     Value lhs = op.lhs();
     Value rhs = op.rhs();
@@ -250,17 +240,12 @@ Value DotBatchingConverter::expandDim0(OpBuilder& builder, Location& loc,
   }
   auto result_type = RankedTensorType::get(result_dims, type.getElementType());
   if (is_static) {
-    auto reshape = builder.create<mhlo::ReshapeOp>(loc, result_type, value);
-    // The created reshape op may appear before `value`. Arrange the order.
-    arrangeOperandsInsertPointInBlock(reshape.getOperation());
-    return reshape;
+    return builder.create<mhlo::ReshapeOp>(loc, result_type, value);
   }
   SmallVector<Value, 4> dims;
   dims.push_back(builder.create<arith::ConstantIndexOp>(loc, 1));
   for (int64_t i = 0; i < type.getRank(); i++) {
     dims.push_back(builder.create<tensor::DimOp>(loc, value, i));
-    // The created dim op may appear before `value`. Arrange the order.
-    arrangeOperandsInsertPointInBlock(dims.back().getDefiningOp());
   }
   auto result_shape = builder.create<tensor::FromElementsOp>(
       loc,
@@ -269,9 +254,6 @@ Value DotBatchingConverter::expandDim0(OpBuilder& builder, Location& loc,
       dims);
   auto dyn_reshape = builder.create<mhlo::DynamicReshapeOp>(
       loc, result_type, value, result_shape);
-  // The created dynamic-reshape op may appear before `value`. Arrange the
-  // order.
-  arrangeOperandsInsertPointInBlock(dyn_reshape.getOperation());
   return dyn_reshape;
 }
 
@@ -285,15 +267,23 @@ bool DotBatchingConverter::applyBatching(BatchCluster& cluster) {
       foremost = op;
     }
   }
-  auto foremost_dot = dyn_cast<mhlo::DotGeneralOp>(foremost);
+  // Move all dot ops, and their consumers if necessary, before the original
+  // foremost dot. This makes sure that the newly created ops in this function
+  // dominates their uses.
+  for (auto op : ops) {
+    if (foremost == op) {
+      continue;
+    }
+    op->moveBefore(foremost);
+    arrangeOperandsInsertPointInBlock(op);
+  }
+  auto last_dot = dyn_cast<mhlo::DotGeneralOp>(foremost);
   // We use the foremost dot to create the builder. Thus we only need to reorder
   // the operands of some newly created ops, rather users of them.
-  OpBuilder builder(foremost_dot);
-  auto orig_lhs_type =
-      foremost_dot.lhs().getType().dyn_cast<RankedTensorType>();
-  auto orig_rhs_type =
-      foremost_dot.rhs().getType().dyn_cast<RankedTensorType>();
-  auto orig_result_type = foremost_dot.getType().dyn_cast<RankedTensorType>();
+  OpBuilder builder(last_dot);
+  auto orig_lhs_type = last_dot.lhs().getType().dyn_cast<RankedTensorType>();
+  auto orig_rhs_type = last_dot.rhs().getType().dyn_cast<RankedTensorType>();
+  auto orig_dot_type = last_dot.getType().dyn_cast<RankedTensorType>();
   SmallVector<Value, 4> lhs_operands;
   SmallVector<Value, 4> rhs_operands;
   for (auto op : ops) {
@@ -301,6 +291,7 @@ bool DotBatchingConverter::applyBatching(BatchCluster& cluster) {
     auto lhs_expand = expandDim0(builder, loc, dot.lhs());
     auto rhs_expand = expandDim0(builder, loc, dot.rhs());
     if (!lhs_expand || !rhs_expand) {
+      LLVM_DEBUG(llvm::dbgs() << "Failed to expand dim for dot merge.\n");
       return false;
     }
     lhs_operands.push_back(lhs_expand);
@@ -330,16 +321,16 @@ bool DotBatchingConverter::applyBatching(BatchCluster& cluster) {
   Value rhs = builder.create<mhlo::ConcatenateOp>(loc, rhs_type, rhs_operands,
                                                   concat_dim);
   // Result type.
-  auto result_rank = orig_result_type.getRank() + 1;
+  auto result_rank = orig_dot_type.getRank() + 1;
   SmallVector<int64_t, 4> result_shapes(result_rank, ShapedType::kDynamicSize);
   result_shapes[0] = ops.size();
   for (int64_t i = 1; i < result_rank; i++) {
-    result_shapes[i] = orig_result_type.getDimSize(i - 1);
+    result_shapes[i] = orig_dot_type.getDimSize(i - 1);
   }
   auto result_type =
-      RankedTensorType::get(result_shapes, orig_result_type.getElementType());
+      RankedTensorType::get(result_shapes, orig_dot_type.getElementType());
   // Build dot dimension numbers.
-  auto dim_numbers = foremost_dot.dot_dimension_numbers();
+  auto dim_numbers = last_dot.dot_dimension_numbers();
 
   SmallVector<int64_t> lhs_batching_dims;
   auto lhs_batch = dim_numbers.getLhsBatchingDimensions();
@@ -368,43 +359,88 @@ bool DotBatchingConverter::applyBatching(BatchCluster& cluster) {
   auto dot_dimension_attr = mhlo::DotDimensionNumbersAttr::get(
       builder.getContext(), lhs_batching_dims, rhs_batching_dims,
       lhs_contracting_dims, rhs_contracting_dims);
+
+  // Create batched dot.
   Value batched_dot = builder.create<mhlo::DotGeneralOp>(
       loc, result_type, lhs, rhs, dot_dimension_attr, nullptr);
 
   Value one = builder.create<arith::ConstantIndexOp>(loc, 1);
   Value zero = builder.create<arith::ConstantIndexOp>(loc, 0);
+  // Build slice and reshape op for each of the original dot op, and replace the
+  // dot.
   for (int64_t i = 0; i < ops.size(); i++) {
-    SmallVector<Value, 4> stride_values(result_rank, one);
-    SmallVector<Value, 4> begin_values(result_rank, zero);
-    begin_values[0] = builder.create<arith::ConstantIndexOp>(loc, i);
-    SmallVector<Value, 4> end_values;
-    end_values.push_back(builder.create<arith::ConstantIndexOp>(loc, i + 1));
-    for (int64_t j = 1; j < result_rank; j++) {
-      end_values.push_back(builder.create<tensor::DimOp>(loc, batched_dot, j));
-    }
-    auto index_ty = builder.getIndexType();
-    auto start_indices = builder.create<tensor::FromElementsOp>(
-        loc,
-        RankedTensorType::get({static_cast<int64_t>(begin_values.size())},
-                              index_ty),
-        begin_values);
-    auto end_indices = builder.create<tensor::FromElementsOp>(
-        loc,
-        RankedTensorType::get({static_cast<int64_t>(end_values.size())},
-                              index_ty),
-        end_values);
-    auto stride_indices = builder.create<tensor::FromElementsOp>(
-        loc,
-        RankedTensorType::get({static_cast<int64_t>(stride_values.size())},
-                              index_ty),
-        stride_values);
     mhlo::DotGeneralOp op = dyn_cast<mhlo::DotGeneralOp>(ops[i]);
-    auto d_slice = builder.create<mhlo::RealDynamicSliceOp>(
-        loc, op.getType().dyn_cast<RankedTensorType>(), batched_dot,
-        start_indices, end_indices, stride_indices);
-    op->replaceAllUsesWith(d_slice);
+    if (orig_dot_type.getNumDynamicDims() == 0) {
+      // Use static-dim ops.
+      SmallVector<int64_t> starts(result_rank, 0);
+      starts[0] = i;
+      SmallVector<int64_t> ends(result_rank);
+      ends[0] = i + 1;
+      for (int64_t i = 1; i < result_rank; i++) {
+        ends[i] = orig_dot_type.getDimSize(i - 1);
+      }
+      SmallVector<int64_t> strides(result_rank, 1);
+      auto slice = builder.create<mhlo::SliceOp>(
+          loc, batched_dot, GetI64ElementsAttr(starts, &builder),
+          GetI64ElementsAttr(ends, &builder),
+          GetI64ElementsAttr(strides, &builder));
+      auto reshape = builder.create<mhlo::ReshapeOp>(loc, orig_dot_type, slice);
+      op->replaceAllUsesWith(reshape);
+    } else {
+      // Use dynamic-dim ops.
+      SmallVector<Value, 4> stride_values(result_rank, one);
+      SmallVector<Value, 4> begin_values(result_rank, zero);
+      begin_values[0] = builder.create<arith::ConstantIndexOp>(loc, i);
+      SmallVector<Value, 4> end_values;
+      end_values.push_back(builder.create<arith::ConstantIndexOp>(loc, i + 1));
+      for (int64_t j = 1; j < result_rank; j++) {
+        end_values.push_back(
+            builder.create<tensor::DimOp>(loc, batched_dot, j));
+      }
+      auto index_ty = builder.getIndexType();
+      auto start_indices = builder.create<tensor::FromElementsOp>(
+          loc,
+          RankedTensorType::get({static_cast<int64_t>(begin_values.size())},
+                                index_ty),
+          begin_values);
+      auto end_indices = builder.create<tensor::FromElementsOp>(
+          loc,
+          RankedTensorType::get({static_cast<int64_t>(end_values.size())},
+                                index_ty),
+          end_values);
+      auto stride_indices = builder.create<tensor::FromElementsOp>(
+          loc,
+          RankedTensorType::get({static_cast<int64_t>(stride_values.size())},
+                                index_ty),
+          stride_values);
+      SmallVector<int64_t, 4> slice_shapes(result_rank,
+                                           ShapedType::kDynamicSize);
+      slice_shapes[0] = 1;
+      for (int64_t i = 1; i < result_rank; i++) {
+        slice_shapes[i] = orig_dot_type.getDimSize(i - 1);
+      }
+      auto slice_type =
+          RankedTensorType::get(slice_shapes, orig_dot_type.getElementType());
+      auto dyn_slice = builder.create<mhlo::RealDynamicSliceOp>(
+          loc, slice_type, batched_dot, start_indices, end_indices,
+          stride_indices);
+      SmallVector<Value, 4> reshape_shape_values;
+      for (int64_t j = 1; j < slice_type.getRank(); j++) {
+        reshape_shape_values.push_back(
+            builder.create<tensor::DimOp>(loc, dyn_slice, j));
+      }
+      auto reshape_shape = builder.create<tensor::FromElementsOp>(
+          loc,
+          RankedTensorType::get(
+              {static_cast<int64_t>(reshape_shape_values.size())}, index_ty),
+          reshape_shape_values);
+      auto dyn_reshape = builder.create<mhlo::DynamicReshapeOp>(
+          loc, orig_dot_type, dyn_slice, reshape_shape);
+      op->replaceAllUsesWith(dyn_reshape);
+    }
   }
-  // Erase replaced ops.
+
+  // No longer need the original dot ops.
   for (int64_t i = 0; i < ops.size(); i++) {
     ops[i]->erase();
   }
@@ -472,7 +508,7 @@ bool DotBatchingConverter::batchingDots() {
             TryMergeNode(&cycle_detector, batched_id, to_batch_id);
         if (!optional_merged_id.hasValue()) {
           // It forms a cycle.
-          continue;  // commented for debugging.
+          continue;
         }
         batched.merge(to_batch);
         batched.leader_op_id = *optional_merged_id;
