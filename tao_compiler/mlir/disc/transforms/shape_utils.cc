@@ -501,22 +501,6 @@ LogicalResult ShapeAnalysis::buildBlockDimValueMap(Block* block) {
       }
       mayCreateOrMapConstInt(operand);
       mayCreateOrMapConstInt(result);
-    } else if (isa<mhlo::DynamicReshapeOp, mhlo::DynamicBroadcastInDimOp>(op)) {
-      auto from_elements = dyn_cast_or_null<tensor::FromElementsOp>(
-          op->getOperand(1).getDefiningOp());
-      Value result = op->getResult(0);
-      auto out_ty = result.getType().dyn_cast_or_null<RankedTensorType>();
-      if (!from_elements || !out_ty) {
-        return WalkResult::advance();
-      }
-      for (int64_t i = 0; i < out_ty.getRank(); i++) {
-        auto dimVal = DimValue(from_elements.getOperand(i));
-        if (failed(buildDimValueMap(result, i, dimVal))) {
-          return WalkResult::interrupt();
-        }
-        mayCreateOrMapConstInt(dimVal);
-      }
-      // TODO: deal with concat as input.
     }
     return res;
   });
