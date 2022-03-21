@@ -19,7 +19,7 @@ func @dot_batching(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>, %m: tensor<in
   %4 = "mhlo.abs"(%1) : (tensor<?x?xf32>) -> tensor<?x?xf32>
   %5 = "mhlo.dot_general"(%3, %4) {dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>} : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   %6 = "mhlo.add"(%2, %5) : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
-  // CHECK-NOT: mhlo.dynamic_reshape
+  // CHECK:     mhlo.dynamic_reshape
   // CHECK:     mhlo.concatenate
   // CHECK:     mhlo.concatenate
   // CHECK:     mhlo.dot_general
@@ -76,8 +76,8 @@ func @dot_not_batching_diff_dtype(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>
   %6 = "mhlo.convert"(%5) : (tensor<?x?xf16>) -> tensor<?x?xf32>
   %7 = "mhlo.add"(%2, %6) : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   // CHECK-NOT: mhlo.concatenate
-  // CHECK: mhlo.dot_general
-  // CHECK: mhlo.dot_general
+  // CHECK:     mhlo.dot_general
+  // CHECK:     mhlo.dot_general
   // CHECK-NOT: lhs_batching_dimensions = [0]
   // CHECK-NOT: rhs_batching_dimensions = [0]
   return %7: tensor<?x?xf32>
@@ -98,8 +98,8 @@ func @dot_not_batching_cycle(%arg0: tensor<?x?xf32>, %arg1: tensor<?x?xf32>, %ar
   %5 = "mhlo.dot_general"(%3, %4) {dot_dimension_numbers = #mhlo.dot<lhs_contracting_dimensions = [1], rhs_contracting_dimensions = [0]>} : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   %6 = "mhlo.add"(%2, %5) : (tensor<?x?xf32>, tensor<?x?xf32>) -> tensor<?x?xf32>
   // CHECK-NOT: mhlo.concatenate
-  // CHECK: mhlo.dot_general
-  // CHECK: mhlo.dot_general
+  // CHECK:     mhlo.dot_general
+  // CHECK:     mhlo.dot_general
   // CHECK-NOT: lhs_batching_dimensions = [0]
   // CHECK-NOT: rhs_batching_dimensions = [0]
   return %5: tensor<?x?xf32>

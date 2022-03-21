@@ -576,6 +576,8 @@ struct DiscDotMergePass : public DiscDotMergePassBase<DiscDotMergePass> {
 void DiscDotMergePass::runOnOperation() {
   FuncOp func = getOperation();
 
+  // TODO: same-operand dot fusion before batching.
+
   if (!dotBatchingSimplifier(func)) {
     signalPassFailure();
   }
