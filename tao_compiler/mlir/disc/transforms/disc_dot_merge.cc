@@ -73,19 +73,19 @@ SmallVector<Value, 4> GetAllPossibleUsedValues(Operation* op) {
 
 // Arrange the insert-point of `op`'s operands in the same block. Do not deal
 // with cross-block operands.
-void arrangeOperandsInsertPointInBlock(Operation* op) {
+void ArrangeOperandsInsertPointInBlock(Operation* op) {
   for (auto operand : GetAllPossibleUsedValues(op)) {
     auto operandOp = operand.getDefiningOp();
     // Note that `isBeforeInBlock` also check whether `op` and `operandOp` are
     // in the same block.
     if ((operandOp != nullptr) && !operandOp->isBeforeInBlock(op)) {
       operandOp->moveBefore(op);
-      arrangeOperandsInsertPointInBlock(operandOp);
+      ArrangeOperandsInsertPointInBlock(operandOp);
     }
   }
 }
 
-void buildBlockGraphCycles(Block* block,
+void BuildBlockGraphCycles(Block* block,
                            std::unique_ptr<GraphCycles>& cycle_detector,
                            DenseMap<Operation*, int64_t>& op_to_node_id) {
   std::vector<Operation*> op_list;
@@ -127,20 +127,85 @@ struct DotCluster {
   SmallVector<Operation*> ops;
 };
 
-class DotBatchingConverter {
+bool TryMergeDotClusters(DotCluster& dst, DotCluster& src,
+                         std::unique_ptr<GraphCycles>& cycle_detector) {
+  // Check cycle.
+  int64_t dst_id = dst.leader_op_id;
+  int64_t src_id = src.leader_op_id;
+  auto optional_merged_id = TryMergeNode(cycle_detector.get(), dst_id, src_id);
+  if (!optional_merged_id.hasValue()) {
+    // It forms a cycle.
+    return false;
+  }
+  dst.merge(src);
+  dst.leader_op_id = *optional_merged_id;
+  return true;
+}
+
+// The `MergingShapeEqualityMap` is a map whose value is a list of dots with
+// same `MergingShape`.
+template <typename MergingShapeEqualityMap>
+bool BuildDotClusters(Block* block,
+                      const MergingShapeEqualityMap& equal_merge_shape_map,
+                      SmallVector<DotCluster>& merging_clusters) {
+  merging_clusters.clear();
+  // Dot ops in `equal_merge_shape_map` can be merged together if the merging
+  // does not introduce cycle.
+
+  // Form cycle detector.
+  std::unique_ptr<GraphCycles> cycle_detector(new GraphCycles(0));
+  DenseMap<Operation*, int64_t> op_to_node_id;
+  BuildBlockGraphCycles(block, cycle_detector, op_to_node_id);
+
+  // Find merge clusters.
+  for (auto& dots_can_merge : equal_merge_shape_map) {
+    auto ops = dots_can_merge.second;
+    if (ops.size() < 2) {
+      continue;
+    }
+    SmallVector<DotCluster> clusters;
+    for (auto op : ops) {
+      clusters.emplace_back(op.getOperation(),
+                            op_to_node_id[op.getOperation()]);
+    }
+    for (int64_t i = 0; i < clusters.size(); i++) {
+      auto& merged = clusters[i];
+      if (merged.ops.empty()) {
+        continue;
+      }
+      for (int64_t j = i + 1; j < clusters.size(); j++) {
+        auto& to_merge = clusters[j];
+        if (to_merge.ops.empty()) {
+          continue;
+        }
+        // Try merge.
+        TryMergeDotClusters(merged, to_merge, cycle_detector);
+      }
+    }
+    for (auto& cluster : clusters) {
+      if (cluster.ops.size() > 1) {
+        merging_clusters.push_back(cluster);
+      }
+    }
+  }
+
+  return true;
+}
+
+class DotBatchMergeConverter {
  public:
-  DotBatchingConverter(FuncOp func) : func_(func){};
+  DotBatchMergeConverter(FuncOp func) : func_(func){};
   bool run();
 
  public:
-  struct DotShape {
+  struct MergingShape {
     DimValue m_dim;
     DimValue n_dim;
     DimValue contracting_dim;
     SmallVector<DimValue> batching_dims;
     mhlo::DotDimensionNumbersAttr dimension_numbers;
     Type element_type;
-    bool operator==(const DotShape& other) const {
+    bool operator==(const MergingShape& other) const {
       return (m_dim == other.m_dim) && (n_dim == other.n_dim) &&
              (contracting_dim == other.contracting_dim) &&
              (batching_dims == other.batching_dims) &&
@@ -149,8 +214,8 @@ class DotBatchingConverter {
     }
   };
 
-  struct DotShapeHash {
-    std::size_t operator()(const DotShape& dotShape) const {
+  struct MergingShapeHash {
+    std::size_t operator()(const MergingShape& dotShape) const {
       std::size_t hash = dotShape.m_dim.hash();
       hash = llvm::hash_combine(hash, dotShape.n_dim.hash());
       hash = llvm::hash_combine(hash, dotShape.contracting_dim.hash());
@@ -181,22 +246,21 @@ class DotBatchingConverter {
     }
   };
 
-  using DotShapeEqualMap =
-      std::unordered_map<DotShape, SmallVector<mhlo::DotGeneralOp>,
-                         DotShapeHash>;
+  using MergingShapeEqualMap =
+      std::unordered_map<MergingShape, SmallVector<mhlo::DotGeneralOp>,
+                         MergingShapeHash>;
 
  private:
-  bool buildShapedDotMap(Block* block, ShapeAnalysis& analysis,
-                         DotShapeEqualMap& equal_shape_map);
-  bool batchingDots(Block* block, const DotShapeEqualMap& equal_shape_map);
+  bool buildMergingShapeMap(Block* block, ShapeAnalysis& analysis,
+                            MergingShapeEqualMap& equal_merge_shape_map);
+  bool applyMerging(DotCluster& cluster);
   Value expandDim0(OpBuilder& builder, Location& loc, Value value);
-  bool applyBatching(DotCluster& cluster);
 
  private:
   FuncOp func_;
 };
 
-bool DotBatchingConverter::run() {
+bool DotBatchMergeConverter::run() {
   ShapeAnalysis analysis(func_);
   if (failed(analysis.run())) {
     LLVM_DEBUG(llvm::dbgs() << "ShapeAnalysis failes for dot merge.\n");
@@ -208,20 +272,28 @@ bool DotBatchingConverter::run() {
 
   for (Block* block : blocks) {
     // A map to help to cluster dots with same shape and dim-numbers together.
-    DotShapeEqualMap equal_shape_map;
-    if (!buildShapedDotMap(block, analysis, equal_shape_map)) {
+    MergingShapeEqualMap equal_merge_shape_map;
+    if (!buildMergingShapeMap(block, analysis, equal_merge_shape_map)) {
       continue;
     }
-    batchingDots(block, equal_shape_map);
+    // Find merging clusters.
+    SmallVector<DotCluster> merging_clusters;
+    BuildDotClusters<MergingShapeEqualMap>(block, equal_merge_shape_map,
+                                           merging_clusters);
+    // Apply merging.
+    for (auto& cluster : merging_clusters) {
+      applyMerging(cluster);
+    }
   }
 
   return true;
 }
 
-bool DotBatchingConverter::buildShapedDotMap(
-    Block* block, ShapeAnalysis& analysis, DotShapeEqualMap& equal_shape_map) {
+bool DotBatchMergeConverter::buildMergingShapeMap(
+    Block* block, ShapeAnalysis& analysis,
+    MergingShapeEqualMap& equal_merge_shape_map) {
   block->walk([&](mhlo::DotGeneralOp op) {
-    DotShape dot_shape;
+    MergingShape dot_shape;
     Value lhs = op.lhs();
     Value rhs = op.rhs();
     // Initialize `dimension_numbers`.
@@ -273,48 +345,13 @@ bool DotBatchingConverter::buildShapedDotMap(
     dot_shape.element_type =
         op.getType().cast<RankedTensorType>().getElementType();
 
-    auto& op_list = equal_shape_map[std::move(dot_shape)];
+    auto& op_list = equal_merge_shape_map[std::move(dot_shape)];
     op_list.push_back(op);
   });
   return true;
 }
 
-// Expand dim 0. We use reshape op to expand it currently. We plan to use
-// tensor.ExpandOp in the future.
-Value DotBatchingConverter::expandDim0(OpBuilder& builder, Location& loc,
-                                       Value value) {
-  auto type = value.getType().dyn_cast<RankedTensorType>();
-  if (!type) {
-    return nullptr;
-  }
-  SmallVector<int64_t, 4> result_dims;
-  result_dims.push_back(1);
-  bool is_static = true;
-  for (int64_t i = 0; i < type.getRank(); i++) {
-    int64_t dim = type.getDimSize(i);
-    is_static &= (dim != ShapedType::kDynamicSize);
-    result_dims.push_back(dim);
-  }
-  auto result_type = RankedTensorType::get(result_dims, type.getElementType());
-  if (is_static) {
-    return builder.create<mhlo::ReshapeOp>(loc, result_type, value);
-  }
-  SmallVector<Value, 4> dims;
-  dims.push_back(builder.create<arith::ConstantIndexOp>(loc, 1));
-  for (int64_t i = 0; i < type.getRank(); i++) {
-    dims.push_back(builder.create<tensor::DimOp>(loc, value, i));
-  }
-  auto result_shape = builder.create<tensor::FromElementsOp>(
-      loc,
-      RankedTensorType::get({static_cast<int64_t>(dims.size())},
-                            builder.getIndexType()),
-      dims);
-  auto dyn_reshape = builder.create<mhlo::DynamicReshapeOp>(
-      loc, result_type, value, result_shape);
-  return dyn_reshape;
-}
-
-bool DotBatchingConverter::applyBatching(DotCluster& cluster) {
+bool DotBatchMergeConverter::applyMerging(DotCluster& cluster) {
   auto& ops = cluster.ops;
   auto loc = ops.front()->getLoc();
   auto foremost = ops.front();
@@ -332,7 +369,7 @@ bool DotBatchingConverter::applyBatching(DotCluster& cluster) {
       continue;
     }
     op->moveBefore(foremost);
-    arrangeOperandsInsertPointInBlock(op);
+    ArrangeOperandsInsertPointInBlock(op);
   }
   auto last_dot = dyn_cast<mhlo::DotGeneralOp>(foremost);
   // We use the foremost dot to create the builder. Thus we only need to reorder
@@ -505,86 +542,39 @@ bool DotBatchingConverter::applyBatching(DotCluster& cluster) {
   return true;
 }
 
-bool DotBatchingConverter::batchingDots(
-    Block* block, const DotShapeEqualMap& equal_shape_map) {
-  // Dot ops in `equal_shape_map` can be batched together if the batching
-  // does not introduce cycle.
-
-  // Form cycle detector.
-  std::unique_ptr<GraphCycles> cycle_detector(new GraphCycles(0));
-  DenseMap<Operation*, int64_t> op_to_node_id;
-  buildBlockGraphCycles(block, cycle_detector, op_to_node_id);
-
-  auto tryMergeDotClusters = [&](DotCluster& dst, DotCluster& src) {
-    // Make sure there is no shared operand. We want to deal with shared operand
-    // in same-operand dot merging phase.
-    // TODO: remove this checking when the same-operand dot merging phase is
-    // done and is placed ahead.
-    DenseSet<Value> lhs_operands;
-    DenseSet<Value> rhs_operands;
-    for (auto op : dst.ops) {
-      lhs_operands.insert(op->getOperand(0));
-      rhs_operands.insert(op->getOperand(1));
-    }
-    for (auto op : src.ops) {
-      if (!lhs_operands.insert(op->getOperand(0)).second ||
-          !rhs_operands.insert(op->getOperand(1)).second) {
-        return false;
-      }
-    }
-
-    // Check cycle.
-    int64_t dst_id = dst.leader_op_id;
-    int64_t src_id = src.leader_op_id;
-    auto optional_merged_id =
-        TryMergeNode(cycle_detector.get(), dst_id, src_id);
-    if (!optional_merged_id.hasValue()) {
-      // It forms a cycle.
-      return false;
-    }
-    dst.merge(src);
-    dst.leader_op_id = *optional_merged_id;
-    return true;
-  };
-
-  // Find batch clusters.
-  SmallVector<DotCluster> batch_clusters;
-  for (auto& equal_dots : equal_shape_map) {
-    auto ops = equal_dots.second;
-    if (ops.size() < 2) {
-      continue;
-    }
-    SmallVector<DotCluster> clusters;
-    for (auto op : ops) {
-      clusters.emplace_back(op.getOperation(),
-                            op_to_node_id[op.getOperation()]);
-    }
-    for (int64_t i = 0; i < clusters.size(); i++) {
-      auto& batched = clusters[i];
-      if (batched.ops.empty()) {
-        continue;
-      }
-      for (int64_t j = i + 1; j < clusters.size(); j++) {
-        auto& to_batch = clusters[j];
-        if (to_batch.ops.empty()) {
-          continue;
-        }
-        // Try merge.
-        tryMergeDotClusters(batched, to_batch);
-      }
-    }
-    for (auto& cluster : clusters) {
-      if (cluster.ops.size() > 1) {
-        batch_clusters.push_back(cluster);
-      }
-    }
+// Expand dim 0. We use reshape op to expand it currently. We plan to use
+// tensor.ExpandOp in the future.
+Value DotBatchMergeConverter::expandDim0(OpBuilder& builder, Location& loc,
+                                         Value value) {
+  auto type = value.getType().dyn_cast<RankedTensorType>();
+  if (!type) {
+    return nullptr;
   }
-
-  // Apply batching.
-  for (auto& cluster : batch_clusters) {
-    applyBatching(cluster);
+  SmallVector<int64_t, 4> result_dims;
+  result_dims.push_back(1);
+  bool is_static = true;
+  for (int64_t i = 0; i < type.getRank(); i++) {
+    int64_t dim = type.getDimSize(i);
+    is_static &= (dim != ShapedType::kDynamicSize);
+    result_dims.push_back(dim);
   }
-  return true;
+  auto result_type = RankedTensorType::get(result_dims, type.getElementType());
+  if (is_static) {
+    return builder.create<mhlo::ReshapeOp>(loc, result_type, value);
+  }
+  SmallVector<Value, 4> dims;
+  dims.push_back(builder.create<arith::ConstantIndexOp>(loc, 1));
+  for (int64_t i = 0; i < type.getRank(); i++) {
+    dims.push_back(builder.create<tensor::DimOp>(loc, value, i));
+  }
+  auto result_shape = builder.create<tensor::FromElementsOp>(
+      loc,
+      RankedTensorType::get({static_cast<int64_t>(dims.size())},
+                            builder.getIndexType()),
+      dims);
+  auto dyn_reshape = builder.create<mhlo::DynamicReshapeOp>(
+      loc, result_type, value, result_shape);
+  return dyn_reshape;
 }
 
 struct DiscDotMergePass : public DiscDotMergePassBase<DiscDotMergePass> {
@@ -593,7 +583,7 @@ struct DiscDotMergePass : public DiscDotMergePassBase<DiscDotMergePass> {
   void runOnOperation() override;
 
  private:
-  bool dotBatchingSimplifier(FuncOp& func);
+  bool dotBatchMerging(FuncOp& func);
 };
 
 void DiscDotMergePass::runOnOperation() {
@@ -601,13 +591,13 @@ void DiscDotMergePass::runOnOperation() {
 
   // TODO: same-operand dot fusion before batching.
 
-  if (!dotBatchingSimplifier(func)) {
+  if (!dotBatchMerging(func)) {
     signalPassFailure();
   }
 }
 
-bool DiscDotMergePass::dotBatchingSimplifier(FuncOp& func) {
-  return DotBatchingConverter(func).run();
+bool DiscDotMergePass::dotBatchMerging(FuncOp& func) {
+  return DotBatchMergeConverter(func).run();
 }
 
 }  // namespace
