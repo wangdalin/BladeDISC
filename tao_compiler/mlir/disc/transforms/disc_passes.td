@@ -368,3 +368,8 @@ def LhloFusionInlinerPass : Pass<"lhlo-fusion-inliner", "FuncOp"> {
     "after its body has been lowered";
   let constructor = "createLhloFusionInlinerPass()";
 }
+
+def DiscDotMergePass : Pass<"disc-dot-merge", "FuncOp"> {
+  let summary = "Dot merge optimization";
+  let constructor = "createDiscDotMergePass()";
+}
